@@ -1,0 +1,478 @@
+---
+title: "Expresión diferencial RNA-seq: G1E vs MK"
+---
+
+```{r}
+#| label: load-packages
+#| code-fold: true
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(RColorBrewer)
+library(DT)
+library(pheatmap)
+library(factoextra)
+library(kableExtra)
+library(plotly)
+
+
+#Bioconductor packages
+
+library(DESeq2)
+library(vsn)
+library(Glimma)
+library(EnhancedVolcano)
+options(DT.options = list(
+  initComplete = JS("function(settings, json) {",
+  "$(this.api().table().header()).css({'background-color': 
+  '#000', 'color': '#fff'});","}")))
+```
+
+Este flujo de trabajo está basado y es un complemento del [Tutorial de Análisis de Expresión Diferencial en Galaxy](https://sites.google.com/view/bioinformatica-genomica/expresi%C3%B3n-diferencial-rna-seq?authuser=0) de la Dra. Alejandra Rougon Cardozo, para llevar a cabo el DESeq con R.
+
+También está basado en:
+
+[Analyzing RNA-seq data with DESeq2](https://www.bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html) de Michael I. Love, Simon Anders y Wolfgang Huber.
+
+[RNA-seq workflow: gene-level exploratory analysis and differential expression](http://master.bioconductor.org/packages/release/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html) de Michael I.Love, Simon Anders, Vladislav Kim y Wolfgang Huber.
+
+[Panorama general de análisis de datos de RNA-seq con R](https://github.com/ComunidadBioInfo/minicurso_abr_2021) de la Red Mexicana de Bioinformática.
+
+# Importar datos
+
+Se cargan los archivos con las tablas de conteos sin normalizar y se crea una tabla que indica la condición para el análisis (en este caso línea celular de cada muestra).
+
+```{r}
+#| code-fold: true
+#| warning: false
+#| message: false
+
+# Se leen los archivos
+
+G1E_rep1 <- read.table("./data/G1E_rep1.tabular", header = TRUE, sep="\t")
+G1E_rep2 <- read.table("./data/G1E_rep2.tabular", header = TRUE, sep="\t")
+MK_rep1 <- read.table("./data/MK_rep1.tabular", header = TRUE, sep="\t")
+MK_rep2 <- read.table("./data/MK_rep2.tabular", header = TRUE, sep="\t")
+
+# Se unen con left_join
+
+countdata_df <- left_join(G1E_rep1, G1E_rep2) |> left_join(MK_rep1) |> 
+                left_join(MK_rep2)
+
+# Se transforma en una matriz
+
+countdata <- as.matrix(dplyr::select(countdata_df, -Geneid))
+row.names(countdata) <- countdata_df$Geneid
+
+# Es necesario que la columna que contiene los nombres de las muestras se llame "names"
+
+coldata <- data.frame(names = factor(colnames(countdata)),
+                      cell = factor(c("G1E", "G1E", "MK", "MK")))
+row.names(coldata) <- coldata$names
+
+
+```
+
+## Matriz de conteos
+
+En este caso, como son pocos transcritos se muestra la matriz.
+
+```{r}
+#| code-fold: true
+kable(countdata, align = "c") %>% kable_styling(c("striped", "hover"), full_width = F)%>% scroll_box(width="100%", height="300px", fixed_thead = TRUE)
+```
+
+## Información de la condición experimental
+
+```{r}
+#| code-fold: true
+
+kable(coldata, align = "c") %>% kable_styling(c("striped", "hover"), full_width = F)%>% scroll_box(width="50%", height="200px", fixed_thead = TRUE)
+```
+
+# DESeqDataSet
+
+Con la matriz de conteos y la tabla con la información de la condición experimental (en este caso línea celular) se crea un objeto de la clase `DESeqDataSet`, el cual tiene una fórmula de diseño asociada. La formula de diseño indica cuales columnas de la tabla de información de las muestras especifican el diseño experimental y cómo se deben utilizar estos factores en el análisis. Aquí se usa la formula `design = ~ cell`. A continuación se muestra la información del objeto generado.
+
+```{r}
+#| code-fold: true
+
+dds <- DESeqDataSetFromMatrix(countData = countdata,
+                              colData = coldata,
+                              design = ~ cell)
+
+dds$cell <- relevel(dds$cell, "MK")
+dds
+```
+
+A partir de este objeto se puede acceder a la matriz de conteos por medio de las funciones `counts(dds)` o `assay(dds)` y a la tabla con la información de las muestras con `colData(dds)`.
+
+# Filtro preliminar
+
+Dado que en la matriz de conteos existen muchas filas que sólo contienen ceros, estas se eliminan.
+
+```{r}
+# Número inicial de filas 
+nrow(dds)
+keep <- rowSums(counts(dds))>1
+dds <- dds[keep, ]
+# Número de filas después del filtro
+nrow(dds)
+```
+
+
+# Análisis de expresión diferencial
+
+El análisis de expresión diferencial se lleva a cabo sobre las conteos sin normalizar por medio de la función `DESeq`:
+
+```{r}
+
+dds <- DESeq(dds)
+dds
+```
+
+Esta función muestra mensajes de los pasos realizados (ver `?DESeq`). Los cuales son: estimar los factores de tamaño (controlando las diferencias en la profundidad de secuenciación de las muestras), la estimación de los valores de dispersión para cada gen, el ajuste de un modelo lineal generalizado, entre otros.
+
+El objeto generado es de la clase `DESeqDataSet` que contiene todos los parámetros ajustados y tablas de resultados.
+
+
+
+
+## Normalización
+
+La normalización en DESeq es crucial ya que los datos de RNA-seq pueden estar sujetos a variaciones [técnicas y biológicas](https://hbctraining.github.io/Training-modules/planning_successful_rnaseq/lessons/sample_level_QC) que pueden dificultar la comparación entre las muestras. La normalización tiene como objetivo corregir estas variaciones para que los datos sean más comparables y se puedan realizar análisis de expresión diferencial más confiables.
+
+DESeq utiliza un enfoque llamado "normalización de factores de tamaño" para lograr esto. El proceso general de normalización en DESeq involucra los siguientes pasos:
+
+1\. **Cálculo de factores de tamaño (size factor):** Para cada muestra, se calcula un "factor de tamaño" que ajusta los conteos brutos para reflejar la cantidad total de lecturas secuenciadas en esa muestra en relación con la cantidad total de lecturas en todas las muestras. Los factores de tamaño son esenciales para tener en cuenta las diferencias en la profundidad de secuenciación entre las muestras. El factor de tamaño para la $j$-ésima columna (muestra) está dado por:
+
+```{=tex}
+\begin{equation}
+s_j=\underset{i: K_i^{R} \neq 0}{mediana} \frac{K_{i j}}{K_i^{R}} \quad \text{ donde } \quad K_i^{R}=\left(\prod_{j=1}^m K_{i j}\right)^{1 / m}
+\end{equation}
+```
+2\. **Aplicación de factores de tamaño:** Se aplican los factores de tamaño a los datos de conteo de cada muestra, dividiendo las cuentas por el factor de tamaño correspondiente. Esto tiene el efecto de normalizar los datos para que sean comparables entre todas las muestras.
+
+
+## Distancia entre las muestras
+
+Se evalúa la similitud general entre las muestras visualizando las matrices de distancias con la función `pheatmat()`. Al calcular la matriz de distancias es necesario brindar la matriz transpuesta de los conteos. A continuación se muestran los heatmaps para la métrica Euclidiana para las matrices sin normalizar y el logaritmo de los valores normalizados.
+
+::: panel-tabset
+### Euclidiana-raw
+
+```{r}
+#| code-fold: true
+
+# Se encuentra la matriz de distancias
+sample_dist_euc_raw <- dist(t(assay(dds)))
+
+sampleDistMatrix_euc_raw <- as.matrix(sample_dist_euc_raw)
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix_euc_raw,
+         clustering_distance_rows = sample_dist_euc_raw,
+         clustering_distance_cols = sample_dist_euc_raw,
+         col = colors)
+
+```
+
+### Euclidiana-normalizados
+
+```{r}
+#| code-fold: true
+norm_log <- log2(counts(dds, normalized=TRUE)+1)
+# Se encuentra la matriz de distancias
+sample_dist_euc_norm <- dist(t(norm_log))
+
+sampleDistMatrix_euc_norm <- as.matrix(sample_dist_euc_norm)
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistMatrix_euc_norm,
+         clustering_distance_rows = sample_dist_euc_norm,
+         clustering_distance_cols = sample_dist_euc_norm,
+         col = colors)
+```
+
+:::
+
+## PCA
+
+`DESeq2` cuenta con la función `plotPCA()` la cual lleva a cabo un análisis de componentes principales considerando como variables los transcritos (toma por default los primeros `ntop=500`) y como observaciones las muestras. El resultado es la gráfica de los scores en el subespacio generado por las dos primeras componentes principales.
+
+```{r}
+#| code-fold: true
+
+se <- SummarizedExperiment(norm_log,
+                           colData=colData(dds))
+# the call to DESeqTransform() is needed to
+# trigger our plotPCA method.
+plotPCA( DESeqTransform( se ), intgroup = "cell")
+```
+
+O bien, podemos utilizar el script que desarrollamos previamente, pero antes exploramos los resultados. 
+
+ 
+
+## Tabla de resultados
+
+Al llamar los resultados sin ningún argumento muestra los log2 fold changes y p-values para la última variable en la fórmula del diseño experimental (en este caso sólo es una variable). Si existieran más de dos niveles en esta variable, los resultados mostrarían la tabla de comparación del último nivel respecto al primer nivel.
+
+```{r}
+#| code-fold: true
+res <- results(dds)
+res
+
+```
+
+
+
+
+
+
+Es posible extraer la tabla como una `DataFrame`, la cual contiene metadatos con información del significado de las columnas:
+
+```{r}
+#| code-fold: true
+res_df <- results(dds, contrast = c("cell", "G1E", "MK"))
+# Se crea una versión tibble
+res_tibble <- as_tibble(res_df)
+#Se crea una data frame usual
+res_data_frame <- as.data.frame(res_df)
+mcols(res_df, use.names = TRUE)
+```
+
+```{r}
+#| code-fold: true
+
+res_data_frame |> 
+  datatable(caption = "DESeq2 results") |> formatRound(c("baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj"), digits = 6)
+```
+
+
+La primera columna, `baseMean`, es el promedio de los valores de las cuentas normalizadas, divididos por los factores de tamaño, tomados de todas las muestras en el `DESeqDataSet`. Las cuatro columnas restantes se refieren a la comparación del nivel `G1E` sobre el nivel de referencia `MK` para la variable `cell`.
+
+La columna `log2FoldChange` es la estimación del tamaño del efecto consecuencia de la condición experimental. Nos dice cuánto parece cambiar la expresión del gen entre las líneas celulares. Este valor se reporta en una escala logarítmica en base 2.
+
+La incertidumbre asociada a esta estimación está disponible en la columna `lfcSE`, que es el error estándar del valor estimado del `log2FoldChange`.
+
+El propósito de un análisis de expresión diferencial es comprobar si los datos proporcionan evidencia suficiente para concluir que el `log2FoldChange` es significativamente diferente de cero. `DESeq2` realiza para cada transcrito una prueba de hipótesis para ver si la evidencia es suficiente para rechazar la hipótesis nula (que la diferencia de expresión es cero y que la diferencia observada entre líneas celulares es causada simplemente por la variabilidad experimental). Como es habitual en estadística, el resultado de esta prueba se reporta por medio de un p-value. `DESeq2` utiliza la corrección de Benjamini-Hochberg (BH) que controla la False Discovery Rate (FDR) : la proporción esperada de falsos positvios entre todas las hipótesis rechazadas, es decir, la FDR mide cuántos de los casos considerados significativos (rechazo de la hipótesis nula) son probablemente falsos. En DESeq se calcula para cada gen un p-value ajustado dado en la columna `padj` y por default considera un treshold de 0.1 para evaluar la hipótesis.
+
+Podemos resumir los resultados con la siguiente línea de código, que proporciona información adicional.
+
+```{r}
+#| code-fold: true
+summary(res)
+```
+
+# Gráficas de resultados
+
+
+## Histrograma de los p-values
+
+```{r}
+#| code-fold: true
+
+ggplot(res_tibble)+
+  geom_histogram(aes(pvalue), binwidth = 0.01, color="gray55", fill="olivedrab2", boundary=0)+
+  theme_bw()
+```
+
+
+## MA plot
+
+El MA plot representa la distribución de los coeficientes estimados en el modelo, es decir, la distribución de los genes o transcritos en las comparaciones de interés. En el eje y, la **M** corresponde a "minus", es la diferencia del logaritmo de los valores que es equivalente al logaritmo del cociente. Y en el eje de de las x, **A** corresponde a *average*, que es el promedio de las cuentas normalizadas para cada gen en todas las muestras.
+
+Este gráfico se puede generar con la función `plotMA()` :
+
+```{r}
+#| code-fold: true
+
+plotMA(res)
+```
+
+O bien, podemos utilizar `ggplot2` para generarla y poder modificar los atributos (se muestra una versión básica):
+
+```{r}
+#| code-fold: true
+
+res_tibble <- mutate(res_tibble, isDE=if_else(padj<0.1, "DE", "nDE", missing="nDE"))
+res_tibble$isDE <- factor(res_tibble$isDE)
+ggplot(res_tibble)+
+  geom_point(aes(baseMean, log2FoldChange, color=isDE), size=2, show.legend = TRUE)+
+  scale_x_log10()+
+  theme_bw()
+```
+
+También es posible generar un MA plot interactivo y gráficas de expresión para genes específicos con el package `Glimma`, para ello es necesario crear una variable `group` que corresponda a los niveles asociados al diseño experimental.
+
+```{r}
+
+group <- colData(dds)$cell
+dds$group <- group
+glimmaMA(dds)
+```
+
+## Volcano plot
+
+De manera análoga al MA plot, en el volcano plot se distinguen los genes o transcritos que muestran expresión diferencial entre líneas celulares. En las ordenadas se grafica $-log_{10}(padj)$ y en las abscisas el log2FoldChange. Este gráfico se puede realizar por medio de la función [`EnhancedVolcano`](https://bioconductor.org/packages/release/bioc/vignettes/EnhancedVolcano/inst/doc/EnhancedVolcano.html) , a continuación se muestra el volcano plot básico.
+
+```{r}
+#| code-fold: true
+#| fig-height: 8
+
+EnhancedVolcano(res,
+                lab= rownames(res),
+                x='log2FoldChange',
+                y= 'pvalue')
+```
+
+También es posible utilizar el package `Glimma` para una versión interactiva del gráfico.
+
+```{r}
+#| code-fold: true
+
+glimmaVolcano(dds)
+```
+
+A partir de los datos podemos generar el plot con ggplot2.
+
+```{r}
+#| code-fold: true  
+
+res_tibble <- mutate(res_tibble, neglog10padj=if_else(is.na(padj), 0, -log10(padj)))  
+ggplot(res_tibble)+   
+  geom_point(aes(log2FoldChange, neglog10padj, color=isDE), size=2, show.legend = TRUE)+   
+  theme_bw()
+```
+
+
+## PCA significativos
+
+Nótese que es necesario aplicar la función sobre la matriz transpuesta del logaritmo de los valores normalizados + 1.
+
+::: panel-tabset
+### Eigenvalores y varianzas
+
+```{r}
+#| code-fold: true
+
+PC_total <- prcomp(t(norm_log[res$pvalue<0.1, ]), scale. = TRUE, center = TRUE)
+
+eig_total <- get_eigenvalue(PC_total)
+eig_tabla <- data.frame(PC=paste0("PC",1:dim(eig_total)[1]), 
+                        Eigenvalor=round(eig_total$eigenvalue,3), 
+                        Varianza=round(eig_total$variance.percent,2), 
+                        Var_acu=round(eig_total$cumulative.variance.percent,2))
+
+kable(eig_tabla, align = "c", col.names = c("Componente", "Eigenvalor", "% varianza", "% varianza acumulada")) %>% kable_styling(c("striped", "hover"), full_width = F)%>% scroll_box(width="100%", height="300px", fixed_thead = TRUE)
+```
+
+### Scree plot
+
+```{r}
+#| code-fold: true
+fviz_eig(PC_total, addlabels = TRUE)
+```
+
+### Coeficientes (Loadings)
+
+```{r}
+#| code-fold: true
+PC_coef <-data.frame(PC_total$rotation)
+kable(PC_coef, align = "c") %>% kable_styling(c("striped", "hover"), full_width = F)%>% scroll_box(width="100%", height="300px", fixed_thead = TRUE)
+```
+
+### Contribución variables completo
+
+```{r}
+#| code-fold: true
+fviz_pca_var(PC_total, col.var = "contrib", gradient.cols=c("#1627dc", "#ffb600", "#ff2e16"), axes=c(1,2), repel=TRUE)
+```
+
+### Contribución variables parcial
+
+```{r}
+#| code-fold: true
+fviz_pca_var(PC_total, col.var = "contrib", gradient.cols=c("#1627dc", "#ffb600", "#ff2e16"), select.var = list(contrib=30), axes=c(1,2))
+```
+
+### Contribución PC1
+
+```{r}
+#| code-fold: true
+fviz_contrib(PC_total, "var", axes = 1)
+```
+
+### Contribución PC2
+
+```{r}
+#| code-fold: true
+fviz_contrib(PC_total, "var", axes = 2, select.var = list(contrib=100))
+```
+
+### Proyección
+
+```{r}
+#| code-fold: true
+fviz_pca_biplot(PC_total,
+                fill.ind = colData(dds)$cell,
+             pointshape = 21,
+             pointsize = 2,
+             label.ind = colData(dds)$cell,
+             arrows=TRUE,
+            ggtheme = theme_bw()
+            )
+
+
+```
+
+### Proyección ggplotly
+
+```{r}
+#| code-fold: true
+proy_scores <- fviz_pca_ind(PC_total,
+             fill.ind = colData(dds)$cell,
+             pointshape = 21,
+             pointsize = 2,
+             label.ind = colData(dds)$cell,
+            ggtheme = theme_bw()
+            )
+
+ggplotly(proy_scores)
+```
+:::
+
+
+
+
+
+
+## Heatmap
+
+Por medio de un heatmap con agrupamiento podemos visualizar la expresión de los transcritos diferencialmente expresados en términos del logaritmo de las cuentas normalizadas.
+
+```{r}
+#| code-fold: true
+#| fig-width: 10
+
+
+##Se filtran las filas que corresponden a los transcritos significativos
+norm_log_map <- t(norm_log[res$pvalue<0.05, ])
+
+##Generar una tabla de anotaciones que incluye el tipo de células
+annotation_row <- coldata[, c("names","cell")]
+##Generar el heatmap empleando clustering jerarquico
+pheatmap(norm_log_map, 
+         border_color = "gray85", 
+         scale = "none",
+         #cellwidth = 25,
+         treeheight_row = 10,
+         treeheight_col = 10,
+         clustering_distance_rows = "euclidean", 
+         clustering_distance_cols = "euclidean", 
+         clustering_method = "ward.D2", 
+         show_colnames = T, 
+         show_rownames = F, 
+         fontsize_col = 6,
+         annotation_row = annotation_row)
+```
